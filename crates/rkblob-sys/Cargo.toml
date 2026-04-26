@@ -11,3 +11,4 @@ bindgen.workspace = true
 rga = []
 rkcrypto = []
 mpp = []
+rknn = []

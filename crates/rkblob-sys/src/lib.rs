@@ -8,3 +8,5 @@ pub mod mpp_sys;
 pub mod rga_sys;
 #[cfg(feature = "rkcrypto")]
 pub mod rkcrypto_sys;
+#[cfg(feature = "rknn")]
+pub mod rknn_sys;

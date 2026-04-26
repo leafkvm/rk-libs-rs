@@ -85,4 +85,20 @@ fn main() {
             "MppEncSeiMode_e",
         ],
     );
+
+    #[cfg(feature = "rknn")]
+    generate_lib_binding(
+        "rknn-runtime",
+        &["rknn.*", "RKNN.*"],
+        &[
+            "_rknn_query_cmd",
+            "_rknn_tensor_type",
+            "_rknn_tensor_qnt_type",
+            "_rknn_tensor_format",
+            "_rknn_core_mask",
+            "_rknn_tensor_mem_flags",
+            "_rknn_mem_alloc_flags",
+            "_rknn_mem_sync_mode",
+        ],
+    );
 }
