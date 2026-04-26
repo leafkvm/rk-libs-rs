@@ -112,6 +112,15 @@ impl Drop for RgaBuffer {
     }
 }
 
+// Safety: `RgaBuffer` is constructed through `wrapbuffer_handle_t()`, which zeroes the
+// descriptor and stores only the imported handle plus scalar image metadata for this
+// handle-backed path. Upstream librga imports and releases that handle via process-global
+// ioctls on a shared session rather than thread-local state, so moving or sharing this
+// wrapper across threads does not create additional aliasing beyond the external dma-buf
+// contract already represented by the underlying buffer handle.
+unsafe impl Send for RgaBuffer {}
+unsafe impl Sync for RgaBuffer {}
+
 impl std::fmt::Debug for RgaBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RgaBuffer")
