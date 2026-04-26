@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+log = "0.4"
+thiserror = "2.0"
+int-enum = "1.2.0"
+nix = "0.31.2"
+bindgen = "0.71"
+pkg-config = "0.3"
+
+rkblob-sys = { path = "./crates/rkblob-sys" }
+rk-dma-buf-mem = { path = "./crates/rk-dma-buf-mem" }
+rk-rga = { path = "./crates/rk-rga" }
+rk-mpp = { path = "./crates/rk-mpp" }
+rkcrypto = { path = "./crates/rkcrypto" }

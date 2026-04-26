@@ -1,0 +1,9 @@
+[package]
+name = "rk-dma-buf-mem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+nix = { workspace = true, features = ["mman", "ioctl", "fs"] }

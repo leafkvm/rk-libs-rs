@@ -1,0 +1,15 @@
+[package]
+name = "rkblob-sys"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+pkg-config.workspace = true
+bindgen.workspace = true
+
+[features]
+rga = []
+rkcrypto = []
+mpp = []
+
+default = ["rga", "rkcrypto", "mpp"]

@@ -1,0 +1,10 @@
+[package]
+name = "rkcrypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rkblob-sys = { workspace = true, features = ["rkcrypto"] }
+log.workspace = true
+thiserror.workspace = true
+int-enum.workspace = true

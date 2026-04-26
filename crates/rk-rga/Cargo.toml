@@ -1,0 +1,10 @@
+[package]
+name = "rk-rga"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rkblob-sys = { workspace = true, features = ["rga"] }
+log.workspace = true
+thiserror.workspace = true
+rk-dma-buf-mem = { workspace = true }

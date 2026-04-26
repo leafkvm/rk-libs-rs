@@ -1,0 +1,7 @@
+[package]
+name = "rk-mpp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rkblob-sys = { workspace = true, features = ["mpp"] }
