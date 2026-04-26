@@ -11,5 +11,3 @@ bindgen.workspace = true
 rga = []
 rkcrypto = []
 mpp = []
-
-default = ["rga", "rkcrypto", "mpp"]
