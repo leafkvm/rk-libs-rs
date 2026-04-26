@@ -13,9 +13,11 @@ int-enum = "1.2.0"
 nix = "0.31.2"
 bindgen = "0.71"
 pkg-config = "0.3"
+bitflags = "2.11"
 
 rkblob-sys = { path = "./crates/rkblob-sys" }
 rk-dma-buf-mem = { path = "./crates/rk-dma-buf-mem" }
 rk-rga = { path = "./crates/rk-rga" }
 rk-mpp = { path = "./crates/rk-mpp" }
 rkcrypto = { path = "./crates/rkcrypto" }
+rknn = { path = "./crates/rknn" }
