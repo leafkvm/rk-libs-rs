@@ -295,6 +295,11 @@ fn check_rga(ret: ffi::IM_STATUS) -> RgaResult {
     }
 }
 
+pub fn imcopy(src: &RgaBuffer, dst: &mut RgaBuffer) -> RgaResult {
+    log::trace!("imcopy: {:?} => {:?}", src, dst);
+    check_rga(unsafe { ffi::imcopy_t(src.rga_buffer, dst.rga_buffer, 1) })
+}
+
 pub fn imcvtcolor(
     src: &RgaBuffer,
     dst: &mut RgaBuffer,
