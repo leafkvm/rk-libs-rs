@@ -77,6 +77,12 @@ pub struct Kmpp {
     inner: Arc<KmppInner>,
 }
 
+// `KmppInner` is immutable after `open()`: the trie mapping is written only
+// by the kernel at setup and read-only from here on, and the fd is used for
+// thread-safe ioctls. The raw trie pointers are what suppress the auto impls.
+unsafe impl Send for Kmpp {}
+unsafe impl Sync for Kmpp {}
+
 impl Kmpp {
     /// Open `/dev/kmpp_objs` and import the kernel's object definitions.
     pub fn open() -> Result<Kmpp> {

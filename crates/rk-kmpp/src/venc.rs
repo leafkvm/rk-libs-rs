@@ -171,6 +171,13 @@ pub struct Venc {
     pool: Mutex<FramePool>,
 }
 
+// `&self` use from multiple threads is safe: the frame pool (the only shared
+// mutable object state) is Mutex-guarded, `_init_cfg` is never accessed after
+// creation, and everything else goes through ioctls, which the kernel
+// serializes per channel.
+unsafe impl Send for Venc {}
+unsafe impl Sync for Venc {}
+
 impl Venc {
     /// Create and start an encoder channel.
     pub fn create(kmpp: &Kmpp, init: &VencInit) -> Result<Venc> {
