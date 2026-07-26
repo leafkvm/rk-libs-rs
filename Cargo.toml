@@ -19,5 +19,6 @@ rkblob-sys = { path = "./crates/rkblob-sys" }
 rk-dma-buf-mem = { path = "./crates/rk-dma-buf-mem" }
 rk-rga = { path = "./crates/rk-rga" }
 rk-mpp = { path = "./crates/rk-mpp" }
+rk-kmpp = { path = "./crates/rk-kmpp" }
 rkcrypto = { path = "./crates/rkcrypto" }
 rknn = { path = "./crates/rknn" }
