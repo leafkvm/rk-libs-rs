@@ -2,7 +2,7 @@ pub use ffi::_Rga_SURF_FORMAT as Format;
 use rkblob_sys::rga_sys::{self as ffi, rga_buffer_t};
 use std::{
     ops::{Deref, DerefMut},
-    os::fd::{AsRawFd as _, BorrowedFd, RawFd},
+    os::fd::{AsRawFd as _, BorrowedFd, OwnedFd, RawFd},
 };
 
 mod color_space;
@@ -85,6 +85,21 @@ impl RgaBuffer {
         Self { handle, rga_buffer }
     }
 
+    /// Import a DMA-BUF fd into RGA and create a buffer handle.
+    /// The fd is NOT consumed/owned by this RgaBuffer - the caller must keep it alive.
+    pub fn from_fd(
+        raw_fd: RawFd,
+        size: usize,
+        width: u32,
+        height: u32,
+        format: Format,
+        wstride: u32,
+        hstride: u32,
+    ) -> Result<Self, RgaError> {
+        let handle = import_handle_fd(raw_fd, size)?;
+        Ok(Self::from_handle(handle, width, height, format, wstride, hstride))
+    }
+
     pub fn width(&self) -> u32 {
         self.rga_buffer.width as u32
     }
@@ -152,6 +167,9 @@ impl OwnedRgaBuffer {
         Ok(Self { rga, dma })
     }
 
+    // TODO: Add some code to trace whether a buffer is "dirty"
+    // If dirty, sync_device_to_cpu before allowing access to the buffer memory, and sync_cpu_to_device after mutation (for read-only access, no need to sync_cpu_to_device).
+    // And do not allow direct access to DmaBuffer; instead, create temporary CPU-accessible slices that enforce the sync contract on drop.
     pub fn dma_buffer(&self) -> &DmaBuffer {
         &self.dma
     }
