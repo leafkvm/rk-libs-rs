@@ -41,6 +41,9 @@ pub enum FrameFormat {
     Yuv422Uyvy = 10,
     Yuv422Vyuy = 11,
     Yuv400 = 12,
+    /// Packed Y,U,V bytes; requires the LeafKVM VEPU511 driver extension.
+    /// No DDR conversion; full-range zero is rounded to one by the Q8 stage.
+    Yuv444Packed = 20,
     Rgb565 = 0x1_0000,
     Bgr565 = 0x1_0001,
     Rgb888 = 0x1_0006,
