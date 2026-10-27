@@ -495,6 +495,64 @@ impl Packet {
     pub fn obj(&self) -> &Obj {
         &self.obj
     }
+
+    /// Per-frame rate-control feedback, from the `enc_*` packet fields of a
+    /// patched kmpp module (leafkvm rk-kmpp-kmod). `None` on a kernel without
+    /// those fields or on a packet the encoder did not fill.
+    pub fn enc_stats(&self) -> Option<EncStats> {
+        let o = &self.obj;
+        if o.get_u32("enc_valid").ok()? == 0 {
+            return None;
+        }
+        Some(EncStats {
+            bit_target: o.get_s32("enc_bit_target").ok()?,
+            bit_real: o.get_s32("enc_bit_real").ok()?,
+            qp_avg: o.get_s32("enc_qp_avg").ok()?,
+            qp_target: o.get_s32("enc_qp_target").ok()?,
+            qp_min: o.get_s32("enc_qp_min").ok()?,
+            qp_max: o.get_s32("enc_qp_max").ok()?,
+            qp_out: o.get_u32("enc_qp_out").ok()?,
+            madi: o.get_s32("enc_madi").ok()?,
+            madp: o.get_s32("enc_madp").ok()?,
+            iblk4_prop: o.get_u32("enc_iblk4_prop").ok()?,
+            motion_level: o.get_u32("enc_motion_lvl").ok()?,
+            complex_level: o.get_u32("enc_cplx_lvl").ok()?,
+            luma_ave: o.get_u32("enc_luma_ave").ok()?,
+            rc_reinit: o.get_u32("enc_rc_reinit").ok()?,
+        })
+    }
+}
+
+/// The encoder's per-frame rate-control feedback (kernel `EncRcTaskInfo`
+/// after `rc_frm_end`), see [`Packet::enc_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncStats {
+    /// Bits the rc model allotted to the frame.
+    pub bit_target: i32,
+    /// Bits the hardware produced.
+    pub bit_real: i32,
+    /// Mean QP over the frame (hardware qp_sum / blocks).
+    pub qp_avg: i32,
+    /// Frame QP the rc model asked for (start QP).
+    pub qp_target: i32,
+    /// Frame QP bounds the rc model applied.
+    pub qp_min: i32,
+    pub qp_max: i32,
+    /// rc model scale QP after the frame (`cur_scale_qp >> 6`).
+    pub qp_out: u32,
+    /// Mean intra / inter (motion) activity from the hardware histograms.
+    pub madi: i32,
+    pub madp: i32,
+    /// Share of intra blocks, scale 256.
+    pub iblk4_prop: u32,
+    /// 0 / 1 / 100 / 200 (none .. strong motion).
+    pub motion_level: u32,
+    /// 0 / 1 / 2 (flat .. complex).
+    pub complex_level: u32,
+    /// Mean luma of the down-scaled picture.
+    pub luma_ave: u32,
+    /// rc model re-inits by runtime cfg changes on this channel so far.
+    pub rc_reinit: u32,
 }
 
 impl std::fmt::Debug for Packet {
