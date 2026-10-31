@@ -3,12 +3,13 @@ use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::stat::Mode;
 use std::ffi::c_void;
 use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::unix::io::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::slice;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Standard cached, scatter-gather DMA heap for devices behind an IOMMU.
 pub const DEFAULT_HEAP_PATH: &str = "/dev/dma_heap/system";
@@ -62,21 +63,174 @@ struct DmaBufSync {
     flags: u64,
 }
 
-/// A struct that represents a DMA buffer, holding ownership of the file
-/// descriptor and the memory-mapped region.
-pub struct DmaBuffer {
+/// A DMA-BUF mapping which owns its FD. Imported mappings are read-only.
+///
+/// CPU slices are available only through access guards. Callers must arrange
+/// device completion before CPU access and avoid submitting or recycling the
+/// buffer until all guards have dropped. SYNC handles cache maintenance and
+/// registered implicit fences, not arbitrary device ownership or buffer reuse.
+#[derive(Debug)]
+pub struct MappedDmaBuffer {
     fd: OwnedFd,
     ptr: NonNull<c_void>,
     size: usize,
+    // Serialize read scopes too: one reader's END must not run while another
+    // reader is still using the mapping. Separate mappings/FD aliases remain
+    // the caller's responsibility.
+    readers: Mutex<()>,
 }
 
-impl std::fmt::Debug for DmaBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DmaBuffer")
-            .field("fd", &self.fd)
-            .field("size", &self.size)
-            .finish()
+impl MappedDmaBuffer {
+    /// Duplicates an imported FD and maps `size` bytes read-only.
+    pub fn map_read_only(fd: std::os::fd::BorrowedFd<'_>, size: usize) -> std::io::Result<Self> {
+        let fd = fd.try_clone_to_owned()?;
+        Self::map_owned(fd, size, ProtFlags::PROT_READ).map_err(std::io::Error::from)
     }
+
+    fn map_owned(fd: OwnedFd, size: usize, prot: ProtFlags) -> Result<Self, nix::Error> {
+        let length = NonZeroUsize::new(size).ok_or(nix::errno::Errno::EINVAL)?;
+        // SAFETY: the mapping owns the FD and unmaps exactly this region on drop.
+        let ptr = unsafe { mmap(None, length, prot, MapFlags::MAP_SHARED, &fd, 0)? };
+        Ok(Self {
+            fd,
+            ptr,
+            size,
+            readers: Mutex::new(()),
+        })
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Begins a read scope. END runs on drop, including during unwinding.
+    /// Do not nest read scopes on the same mapping: they are serialized.
+    /// Persistent sync errors abort the process; EINTR/EAGAIN are retried.
+    pub fn read(&self) -> CpuReadAccess<'_> {
+        // This lock protects access scope ordering, not data that could become
+        // inconsistent after a panic. The previous guard still issued END.
+        let lock = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        CpuReadAccess {
+            mapping: self,
+            _lock: lock,
+        }
+    }
+
+    fn sync(&self, flags: u64) {
+        let sync_data = DmaBufSync { flags };
+        loop {
+            // SAFETY: the FD is owned and the ioctl argument has the UAPI layout.
+            match unsafe { dma_buf_sync(self.fd.as_raw_fd(), &sync_data) } {
+                Ok(_) => return,
+                Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => continue,
+                Err(err) => {
+                    // A panic could kill only a worker, or panic again during
+                    // unwinding. Never continue with uncertain cache ownership.
+                    // Ignore diagnostic I/O errors so they cannot prevent abort.
+                    use std::io::Write;
+                    let operation = if flags & DMA_BUF_SYNC_END != 0 {
+                        "END"
+                    } else {
+                        "START"
+                    };
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "fatal DMA_BUF_IOCTL_SYNC {operation}: fd={}, flags={flags:#x}: {err}",
+                        self.fd.as_raw_fd()
+                    );
+                    std::process::abort();
+                }
+            }
+        }
+    }
+}
+
+impl AsRawFd for MappedDmaBuffer {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl AsFd for MappedDmaBuffer {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl Drop for MappedDmaBuffer {
+    fn drop(&mut self) {
+        // SAFETY: guards borrow this mapping and cannot outlive it.
+        if let Err(e) = unsafe { munmap(self.ptr, self.size) } {
+            log::error!("Failed to unmap DMA buffer: {e}");
+        }
+    }
+}
+
+// SAFETY: the owned mapping can move between threads. Shared CPU access is
+// read-only and serialized; writable access requires an exclusive borrow.
+// Device access and other aliases must obey the ownership contract above.
+unsafe impl Send for MappedDmaBuffer {}
+unsafe impl Sync for MappedDmaBuffer {}
+
+/// Read-only CPU access, ending before the borrowed mapping can be destroyed.
+#[must_use = "keep the guard alive for the entire CPU access"]
+pub struct CpuReadAccess<'a> {
+    mapping: &'a MappedDmaBuffer,
+    _lock: MutexGuard<'a, ()>,
+}
+
+impl Deref for CpuReadAccess<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: START completed; the slice is bounded by this guard's borrow.
+        unsafe { slice::from_raw_parts(self.mapping.ptr.as_ptr().cast(), self.mapping.size) }
+    }
+}
+
+impl Drop for CpuReadAccess<'_> {
+    fn drop(&mut self) {
+        // The lock is released after END, when fields are dropped.
+        self.mapping.sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+    }
+}
+
+/// Writable CPU access. A write-only scope must not read previous contents;
+/// use `read_write()` for read-modify-write operations or partial rendering.
+#[must_use = "keep the guard alive for the entire CPU access"]
+pub struct CpuWriteAccess<'a> {
+    mapping: &'a mut MappedDmaBuffer,
+    direction: u64,
+}
+
+impl Deref for CpuWriteAccess<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: START completed and this guard exclusively borrows the mapping.
+        unsafe { slice::from_raw_parts(self.mapping.ptr.as_ptr().cast(), self.mapping.size) }
+    }
+}
+
+impl DerefMut for CpuWriteAccess<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the mutable slice cannot outlive the exclusive guard borrow.
+        unsafe { slice::from_raw_parts_mut(self.mapping.ptr.as_ptr().cast(), self.mapping.size) }
+    }
+}
+
+impl Drop for CpuWriteAccess<'_> {
+    fn drop(&mut self) {
+        self.mapping.sync(DMA_BUF_SYNC_END | self.direction);
+    }
+}
+
+/// Heap-allocated DMA-BUF with a writable mapping and scoped CPU access.
+///
+/// Every access guard retries EINTR/EAGAIN on START and END. Other sync errors
+/// abort the process, including on drop; allocation and mapping remain fallible.
+#[derive(Debug)]
+pub struct DmaBuffer {
+    mapping: MappedDmaBuffer,
 }
 
 impl DmaBuffer {
@@ -86,7 +240,6 @@ impl DmaBuffer {
     }
 
     /// Allocates from an explicit DMA heap using the standard Linux heap ABI.
-    /// CPU access must be bracketed by the two sync methods, including reads.
     pub fn new_in_heap(heap_path: &Path, size: usize) -> Result<Self, nix::Error> {
         Self::allocate(heap_path, size).map_err(|err| {
             log::error!(
@@ -98,95 +251,60 @@ impl DmaBuffer {
     }
 
     fn allocate(heap_path: &Path, size: usize) -> Result<Self, nix::Error> {
-        let length = NonZeroUsize::new(size).ok_or(nix::errno::Errno::EINVAL)?;
-        // OwnedFd closes the heap on every path, including a failed ioctl.
+        NonZeroUsize::new(size).ok_or(nix::errno::Errno::EINVAL)?;
         let heap_fd = open(heap_path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())?;
-
         let mut alloc_data = DmaHeapAllocationData {
             len: size as u64,
             fd_flags: (OFlag::O_CLOEXEC | OFlag::O_RDWR).bits() as u32,
             ..Default::default()
         };
-
-        // The allocation happens here.
+        // SAFETY: valid heap FD and allocation ioctl argument.
         unsafe {
             dma_heap_alloc(heap_fd.as_raw_fd(), &mut alloc_data)?;
         }
-
-        drop(heap_fd);
-
+        // SAFETY: successful allocation transfers ownership of this new FD.
         let fd = unsafe { OwnedFd::from_raw_fd(alloc_data.fd) };
-
-        let prot = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-        let map_flags = MapFlags::MAP_SHARED;
-        let ptr = unsafe { mmap(None, length, prot, map_flags, &fd, 0)? };
-
-        Ok(Self { fd, ptr, size })
+        let mapping =
+            MappedDmaBuffer::map_owned(fd, size, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)?;
+        Ok(Self { mapping })
     }
 
-    /// Begins CPU access (DMA_BUF_SYNC_START | RW). Wait for device completion
-    /// before calling; cache synchronization does not wait for RGA/encoder work.
-    pub fn sync_device_to_cpu(&self) -> Result<(), nix::Error> {
-        let mut sync_data = DmaBufSync {
-            flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW,
-        };
-        unsafe {
-            dma_buf_sync(self.fd.as_raw_fd(), &mut sync_data)?;
-        }
-        Ok(())
-    }
-
-    /// Ends CPU access (DMA_BUF_SYNC_END | RW), including read-only access.
-    pub fn sync_cpu_to_device(&self) -> Result<(), nix::Error> {
-        let mut sync_data = DmaBufSync {
-            flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW,
-        };
-        unsafe {
-            dma_buf_sync(self.fd.as_raw_fd(), &mut sync_data)?;
-        }
-        Ok(())
-    }
-
-    /// Returns the size of the buffer.
     pub fn size(&self) -> usize {
-        self.size
+        self.mapping.size()
     }
 
-    /// Returns a shared slice over the buffer contents.
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr() as *const u8, self.size) }
+    pub fn read(&self) -> CpuReadAccess<'_> {
+        self.mapping.read()
     }
 
-    /// Returns a mutable slice over the buffer contents.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u8, self.size) }
+    /// Begins write-only CPU access. Do not read previous contents through the
+    /// returned slice. Device submission must follow the guard's drop.
+    pub fn write(&mut self) -> CpuWriteAccess<'_> {
+        self.access_mut(DMA_BUF_SYNC_WRITE)
+    }
+
+    /// Begins CPU access which may read and modify existing contents.
+    pub fn read_write(&mut self) -> CpuWriteAccess<'_> {
+        self.access_mut(DMA_BUF_SYNC_RW)
+    }
+
+    fn access_mut(&mut self, direction: u64) -> CpuWriteAccess<'_> {
+        self.mapping.sync(DMA_BUF_SYNC_START | direction);
+        CpuWriteAccess {
+            mapping: &mut self.mapping,
+            direction,
+        }
     }
 }
 
 impl AsRawFd for DmaBuffer {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-
-impl Drop for DmaBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            if let Err(e) = munmap(self.ptr, self.size) {
-                // In a real application, you might want to log this error.
-                eprintln!("Failed to unmap memory: {}", e);
-            }
-        }
+        self.mapping.as_raw_fd()
     }
 }
 
 impl AsFd for DmaBuffer {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.fd.as_fd()
+        self.mapping.as_fd()
     }
 }
-
-// Ensure the DmaBuffer is Send + Sync as it holds a raw pointer,
-// but the underlying memory and fd are safe to be sent across threads.
-unsafe impl Send for DmaBuffer {}
-unsafe impl Sync for DmaBuffer {}

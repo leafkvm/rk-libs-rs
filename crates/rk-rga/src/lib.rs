@@ -167,9 +167,8 @@ impl OwnedRgaBuffer {
         Ok(Self { rga, dma })
     }
 
-    // TODO: Add some code to trace whether a buffer is "dirty"
-    // If dirty, sync_device_to_cpu before allowing access to the buffer memory, and sync_cpu_to_device after mutation (for read-only access, no need to sync_cpu_to_device).
-    // And do not allow direct access to DmaBuffer; instead, create temporary CPU-accessible slices that enforce the sync contract on drop.
+    /// Use the DMA buffer's CPU-access guards for mapped reads and writes.
+    /// Drop every guard before submitting another RGA operation on this buffer.
     pub fn dma_buffer(&self) -> &DmaBuffer {
         &self.dma
     }
