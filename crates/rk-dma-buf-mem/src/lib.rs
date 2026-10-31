@@ -1,15 +1,32 @@
 use nix::fcntl::{open, OFlag};
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::stat::Mode;
-use nix::unistd::close;
 use std::ffi::c_void;
 use std::num::NonZeroUsize;
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::unix::io::{AsFd, AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::slice;
+use std::sync::OnceLock;
 
-const HEAP_PATH: &str = "/dev/rk_dma_heap/rk-dma-heap-cma";
+/// Standard cached, scatter-gather DMA heap for devices behind an IOMMU.
+pub const DEFAULT_HEAP_PATH: &str = "/dev/dma_heap/system";
+
+/// Process-wide allocation policy, read once on first allocation.
+/// Set `RK_DMA_HEAP` before starting the process to select a board's contiguous
+/// heap when its devices have no IOMMU. There is deliberately no fallback: a
+/// fallback can hide an invalid DMA policy or an exhausted heap.
+pub fn default_heap_path() -> &'static Path {
+    static HEAP_PATH: OnceLock<PathBuf> = OnceLock::new();
+    HEAP_PATH.get_or_init(|| {
+        let path = std::env::var_os("RK_DMA_HEAP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_HEAP_PATH));
+        log::info!("DMA buffer heap: {}", path.display());
+        path
+    })
+}
 
 // Define the necessary constants from the C header.
 const DMA_HEAP_IOC_MAGIC: u8 = b'H';
@@ -63,18 +80,27 @@ impl std::fmt::Debug for DmaBuffer {
 }
 
 impl DmaBuffer {
-    /// Allocates a new DMA buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `heap_path` - The path to the DMA heap device.
-    /// * `size` - The desired size of the buffer in bytes.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new `DmaBuffer` on success, or a `nix::Error` on failure.
+    /// Allocates from the process-wide heap selected by [`default_heap_path`].
     pub fn new(size: usize) -> Result<Self, nix::Error> {
-        let heap_fd = open(HEAP_PATH, OFlag::O_RDWR, Mode::empty())?;
+        Self::new_in_heap(default_heap_path(), size)
+    }
+
+    /// Allocates from an explicit DMA heap using the standard Linux heap ABI.
+    /// CPU access must be bracketed by the two sync methods, including reads.
+    pub fn new_in_heap(heap_path: &Path, size: usize) -> Result<Self, nix::Error> {
+        Self::allocate(heap_path, size).map_err(|err| {
+            log::error!(
+                "DMA allocation: heap={}, size={size}: {err}",
+                heap_path.display()
+            );
+            err
+        })
+    }
+
+    fn allocate(heap_path: &Path, size: usize) -> Result<Self, nix::Error> {
+        let length = NonZeroUsize::new(size).ok_or(nix::errno::Errno::EINVAL)?;
+        // OwnedFd closes the heap on every path, including a failed ioctl.
+        let heap_fd = open(heap_path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())?;
 
         let mut alloc_data = DmaHeapAllocationData {
             len: size as u64,
@@ -87,27 +113,19 @@ impl DmaBuffer {
             dma_heap_alloc(heap_fd.as_raw_fd(), &mut alloc_data)?;
         }
 
-        close(heap_fd)?;
+        drop(heap_fd);
 
         let fd = unsafe { OwnedFd::from_raw_fd(alloc_data.fd) };
 
         let prot = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
         let map_flags = MapFlags::MAP_SHARED;
-        let ptr = unsafe {
-            mmap(
-                None,
-                NonZeroUsize::try_from(size).unwrap(),
-                prot,
-                map_flags,
-                &fd,
-                0,
-            )?
-        };
+        let ptr = unsafe { mmap(None, length, prot, map_flags, &fd, 0)? };
 
         Ok(Self { fd, ptr, size })
     }
 
-    /// Synchronizes the buffer from the device to the CPU.
+    /// Begins CPU access (DMA_BUF_SYNC_START | RW). Wait for device completion
+    /// before calling; cache synchronization does not wait for RGA/encoder work.
     pub fn sync_device_to_cpu(&self) -> Result<(), nix::Error> {
         let mut sync_data = DmaBufSync {
             flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW,
@@ -118,7 +136,7 @@ impl DmaBuffer {
         Ok(())
     }
 
-    /// Synchronizes the buffer from the CPU to the device.
+    /// Ends CPU access (DMA_BUF_SYNC_END | RW), including read-only access.
     pub fn sync_cpu_to_device(&self) -> Result<(), nix::Error> {
         let mut sync_data = DmaBufSync {
             flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW,
