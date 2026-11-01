@@ -479,13 +479,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rk-mpp"
-version = "0.1.0"
-dependencies = [
- "rkblob-sys",
-]
-
-[[package]]
 name = "rk-rga"
 version = "0.1.0"
 dependencies = [
@@ -509,15 +502,6 @@ version = "0.1.0"
 dependencies = [
  "int-enum",
  "log",
- "rkblob-sys",
- "thiserror",
-]
-
-[[package]]
-name = "rknn"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.11.1",
  "rkblob-sys",
  "thiserror",
 ]

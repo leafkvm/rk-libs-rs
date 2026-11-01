@@ -1,9 +1,0 @@
-[package]
-name = "rknn"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-bitflags.workspace = true
-thiserror.workspace = true
-rkblob-sys = { workspace = true, features = ["rknn"] }
