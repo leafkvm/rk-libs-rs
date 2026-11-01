@@ -16,6 +16,17 @@
 //!   into this process, so [`Packet::data`] is zero-copy. Dropping the
 //!   [`Packet`] recycles its ring space — hold it only as long as needed.
 //!
+//! * progressive input (patched `kmpp.ko` only, see
+//!   [`Venc::supports_progressive`]) — a frame submitted with
+//!   [`InputMode::Progressive`] before its capture has finished is read by the
+//!   encoder no further than the rows declared ready; [`Venc::progress`] /
+//!   [`Venc::complete`] advance that count and [`Venc::abort`] ends the frame
+//!   without output. Every tracked frame ([`InputMode::Tracked`] or
+//!   `Progressive`) yields exactly one packet record with its `dts`: an encoded
+//!   packet, or one with [`Packet::is_discarded`]. Reading that record means
+//!   the encoder is done with the input buffer. `progress` does not wait for
+//!   other calls on the channel, so it can run on its own thread.
+//!
 //! This crate expects this project's patched `kmpp.ko`, whose vcodec driver
 //! returns distinct errnos: `EAGAIN` for backpressure (input queue full /
 //! output queue empty), `EFAULT` for bad user pointers, `EINVAL` for bad
@@ -27,7 +38,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
 
 use crate::abi::{
-    KmppShmPtr, VcodecMsg, MPP_ENC_GET_CFG, MPP_ENC_SET_CFG, MPP_ENC_SET_HEADER_MODE,
+    KmppShmPtr, VcodecFrmProgress, VcodecMsg, KMPP_FRM_IN_PROGRESSIVE, KMPP_FRM_IN_TRACKED,
+    VCODEC_CHAN_IN_FRM_PROGRESS, VCODEC_PROG_ABORT, VCODEC_PROG_COMPLETE, MPP_ENC_GET_CFG, MPP_ENC_SET_CFG, MPP_ENC_SET_HEADER_MODE,
     MPP_ENC_SET_IDR_FRAME, VCODEC_CHAN_CONTROL, VCODEC_CHAN_CREATE, VCODEC_CHAN_DESTROY,
     VCODEC_CHAN_IN_FRM_RDY, VCODEC_CHAN_OUT_PKT_RDY, VCODEC_CHAN_PAUSE, VCODEC_CHAN_RESUME,
     VCODEC_CHAN_START, VCODEC_CHAN_STOP, VOCDEC_IOC_CFG,
@@ -85,6 +97,62 @@ impl VencInit {
     }
 }
 
+/// How the encoder takes an input frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputMode {
+    /// Ordinary complete frame (stock behaviour: a frame the encoder drops
+    /// produces no packet at all).
+    #[default]
+    Complete,
+    /// Complete frame with a guaranteed packet record (see the module docs).
+    Tracked,
+    /// Frame still being captured: the encoder reads no row `>= ready_rows`
+    /// (luma rows counted from buffer row 0) until [`Venc::progress`] or
+    /// [`Venc::complete`] moves the limit. Implies a record. The `dts` must be
+    /// greater than every earlier tracked frame's on this channel.
+    Progressive { ready_rows: u32 },
+}
+
+/// Why a tracked frame's record carries no bitstream, or `Encoded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputStatus {
+    Encoded,
+    /// [`Venc::abort`].
+    Aborted,
+    /// No progress for the kernel's `prog_stall_ms` (default 200 ms).
+    Stalled,
+    /// Dropped by the encoder (rate control, config/size mismatch, stream
+    /// overflow) or by a channel stop.
+    Dropped,
+    /// Hardware error or task timeout.
+    HwError,
+    Unknown(u32),
+}
+
+impl InputStatus {
+    fn from_raw(v: u32) -> InputStatus {
+        match v {
+            0 => InputStatus::Encoded,
+            1 => InputStatus::Aborted,
+            2 => InputStatus::Stalled,
+            3 => InputStatus::Dropped,
+            4 => InputStatus::HwError,
+            n => InputStatus::Unknown(n),
+        }
+    }
+}
+
+/// Timing of a tracked frame, from its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputTiming {
+    /// Ready rows when the hardware started; `>= height`: the encoder never
+    /// waited for input.
+    pub rows_start: u32,
+    /// Microseconds from the update that completed the frame to the end of
+    /// the encode; 0 when it was complete at the start.
+    pub tail_us: u32,
+}
+
 /// Geometry and content of one input frame. The pixel data lives in a
 /// dma-buf; the kernel imports the fd on submit.
 #[derive(Debug, Clone)]
@@ -107,6 +175,7 @@ pub struct FrameDesc {
     pub buf_fd: RawFd,
     pub pts: i64,
     pub dts: i64,
+    pub input: InputMode,
 }
 
 impl FrameDesc {
@@ -123,6 +192,7 @@ impl FrameDesc {
             buf_fd,
             pts: 0,
             dts: 0,
+            input: InputMode::Complete,
         }
     }
 }
@@ -169,6 +239,8 @@ pub struct Venc {
     /// to this object from `mpp_enc_init`.
     _init_cfg: Obj,
     pool: Mutex<FramePool>,
+    /// The kernel's `KmppFrame` has the progressive-input fields.
+    progressive: bool,
 }
 
 // `&self` use from multiple threads is safe: the frame pool (the only shared
@@ -228,6 +300,10 @@ impl Venc {
             frames.push(kmpp.alloc("KmppFrame")?);
         }
 
+        let progressive = kmpp
+            .def("KmppFrame")
+            .is_some_and(|d| d.field("in_flags").is_some() && d.field("ready_rows").is_some());
+
         log::info!("kmpp venc chan {chan_id} created ({:?})", init.coding);
 
         Ok(Venc {
@@ -236,6 +312,7 @@ impl Venc {
             chan_id,
             _init_cfg: cfg,
             pool: Mutex::new(FramePool { frames, next: 0 }),
+            progressive,
         })
     }
 
@@ -295,11 +372,26 @@ impl Venc {
         vcodec_ioctl_nodata(&self.fd, VCODEC_CHAN_START, 0).map_err(|e| Error::Sys { op: "VCODEC_CHAN_START", source: e })
     }
 
+    /// Whether the kernel module takes [`InputMode::Tracked`] /
+    /// [`InputMode::Progressive`] frames.
+    pub fn supports_progressive(&self) -> bool {
+        self.progressive
+    }
+
     /// Submit one frame for encoding. Never blocks; returns
     /// [`Error::QueueFull`] when the kernel's 2-deep input queue is full
-    /// (`EAGAIN` — drain packets, or drop the frame and move on). Any other
-    /// errno is a genuine fault and surfaces as [`Error::Sys`].
+    /// (`EAGAIN` — drain packets, or drop the frame and move on), and
+    /// [`Error::InputRejected`] when a tracked frame cannot be taken. Any
+    /// other errno is a genuine fault and surfaces as [`Error::Sys`].
     pub fn put_frame(&self, desc: &FrameDesc) -> Result<()> {
+        let (in_flags, ready_rows) = match desc.input {
+            InputMode::Complete => (0, 0),
+            InputMode::Tracked => (KMPP_FRM_IN_TRACKED, 0),
+            InputMode::Progressive { ready_rows } => (KMPP_FRM_IN_TRACKED | KMPP_FRM_IN_PROGRESSIVE, ready_rows),
+        };
+        if in_flags != 0 && !self.progressive {
+            return Err(Error::InputRejected);
+        }
         let mut pool = self.pool.lock().unwrap();
         let idx = pool.next;
         let frame = &pool.frames[idx];
@@ -316,12 +408,66 @@ impl Venc {
         frame.set_s64("pts", desc.pts)?;
         frame.set_s64("dts", desc.dts)?;
         frame.set_u32("buf_fd", desc.buf_fd as u32)?;
+        // Pooled objects are reused: always write both fields when they exist.
+        if self.progressive {
+            frame.set_u32("in_flags", in_flags)?;
+            frame.set_u32("ready_rows", ready_rows)?;
+        }
 
         vcodec_ioctl(&self.fd, VCODEC_CHAN_IN_FRM_RDY, 0, frame.shm_ptr())
             .map_err(frm_rdy_error)?;
 
         pool.next = (idx + 1) % pool.frames.len();
         Ok(())
+    }
+
+    /// Advance a progressive frame to `rows` ready luma rows (cumulative;
+    /// smaller values are ignored). `Ok(false)`: the frame has already ended
+    /// (or was never submitted), which is harmless for a late update.
+    /// Serialized with other ioctls on this fd, so it may wait for an earlier
+    /// call (including teardown); this operation itself does not wait for
+    /// capture to supply more rows or for the frame to finish encoding.
+    pub fn progress(&self, dts: i64, rows: u32) -> Result<bool> {
+        self.frm_progress(dts, rows, 0)
+    }
+
+    /// Mark a tracked frame's capture as complete.
+    pub fn complete(&self, dts: i64) -> Result<bool> {
+        self.frm_progress(dts, 0, VCODEC_PROG_COMPLETE)
+    }
+
+    /// End a tracked frame without output (its capture failed). Its record
+    /// is a discard ([`InputStatus::Aborted`]). `Ok(false)`: too late, the
+    /// frame's outcome was already decided.
+    pub fn abort(&self, dts: i64) -> Result<bool> {
+        self.frm_progress(dts, 0, VCODEC_PROG_ABORT)
+    }
+
+    fn frm_progress(&self, dts: i64, rows: u32, flags: u32) -> Result<bool> {
+        let arg = VcodecFrmProgress {
+            dts,
+            rows,
+            flags,
+            reserved: [0; 2],
+        };
+        let msg = VcodecMsg {
+            cmd: VCODEC_CHAN_IN_FRM_PROGRESS,
+            ctrl_cmd: 0,
+            size: core::mem::size_of::<VcodecFrmProgress>() as u32,
+            data_ptr: &arg as *const VcodecFrmProgress as u64,
+        };
+        let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), VOCDEC_IOC_CFG as _, &msg) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENOENT) => Ok(false),
+                _ => Err(Error::Sys {
+                    op: "VCODEC_CHAN_IN_FRM_PROGRESS",
+                    source: e,
+                }),
+            };
+        }
+        Ok(true)
     }
 
     /// Signal end of stream. The kernel emits a final empty packet with the
@@ -491,6 +637,25 @@ impl Packet {
         self.flag & packet_flag::EOS != 0
     }
 
+    /// A tracked frame's record without bitstream: do not send it.
+    pub fn is_discarded(&self) -> bool {
+        self.flag & packet_flag::DISCARD != 0
+    }
+
+    /// Outcome of a tracked frame; `None` on a kernel without
+    /// progressive-input support. Untracked frames read as `Encoded`.
+    pub fn input_status(&self) -> Option<InputStatus> {
+        self.obj.get_u32("in_status").ok().map(InputStatus::from_raw)
+    }
+
+    /// Input timing of a tracked frame (zeros for untracked frames).
+    pub fn input_timing(&self) -> Option<InputTiming> {
+        Some(InputTiming {
+            rows_start: self.obj.get_u32("in_rows_start").ok()?,
+            tail_us: self.obj.get_u32("in_tail_us").ok()?,
+        })
+    }
+
     /// The underlying `KmppPacket` object, for fields not surfaced here.
     pub fn obj(&self) -> &Obj {
         &self.obj
@@ -570,6 +735,7 @@ impl std::fmt::Debug for Packet {
 fn frm_rdy_error(e: std::io::Error) -> Error {
     match e.raw_os_error() {
         Some(libc::EAGAIN) => Error::QueueFull,
+        Some(libc::EINVAL) => Error::InputRejected,
         _ => Error::Sys {
             op: "VCODEC_CHAN_IN_FRM_RDY",
             source: e,

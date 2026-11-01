@@ -83,6 +83,13 @@ pub enum Error {
     /// vcodec driver, which reports backpressure distinctly from faults).
     #[error("encoder input queue full")]
     QueueFull,
+
+    /// A tracked / progressive frame was rejected (`EINVAL`): the channel
+    /// cannot gate this input (codec, rotation, crop offset, ...), the `dts`
+    /// is not greater than the previous tracked frame's, or the kernel has
+    /// no progressive-input support.
+    #[error("encoder rejected the tracked input frame")]
+    InputRejected,
 }
 
 impl Error {

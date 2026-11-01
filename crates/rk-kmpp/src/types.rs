@@ -122,6 +122,9 @@ pub mod packet_flag {
     pub const INTRA: u32 = 0x10;
     pub const PARTITION: u32 = 0x20;
     pub const EOI: u32 = 0x40;
+    /// leafkvm progressive input: a record without bitstream, see
+    /// [`crate::venc::InputStatus`].
+    pub const DISCARD: u32 = 0x80;
 }
 
 /// `MppPollType` values for `input_timeout` / `output_timeout`.

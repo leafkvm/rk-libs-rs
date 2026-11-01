@@ -80,6 +80,23 @@ pub const VCODEC_CHAN_PAUSE: u32 = 0x0000_0102;
 pub const VCODEC_CHAN_RESUME: u32 = 0x0000_0103;
 pub const VCODEC_CHAN_IN_FRM_RDY: u32 = 0x0000_0400;
 pub const VCODEC_CHAN_OUT_PKT_RDY: u32 = 0x0000_0603;
+/// leafkvm progressive input (`include/rk-vcodec-prog.h`).
+pub const VCODEC_CHAN_IN_FRM_PROGRESS: u32 = 0x0000_0480;
+pub const VCODEC_PROG_COMPLETE: u32 = 1 << 0;
+pub const VCODEC_PROG_ABORT: u32 = 1 << 1;
+/// `KmppFrame.in_flags` bits.
+pub const KMPP_FRM_IN_TRACKED: u32 = 1 << 0;
+pub const KMPP_FRM_IN_PROGRESSIVE: u32 = 1 << 1;
+
+/// `struct vcodec_frm_progress`, payload of `VCODEC_CHAN_IN_FRM_PROGRESS`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VcodecFrmProgress {
+    pub dts: i64,
+    pub rows: u32,
+    pub flags: u32,
+    pub reserved: [u32; 2],
+}
 
 // MpiCmd control command ids (inc/rk_mpi_cmd.h) used with VCODEC_CHAN_CONTROL.
 pub const MPP_ENC_SET_CFG: u32 = 0x0032_0001;
